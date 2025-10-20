@@ -42,11 +42,6 @@ def data_to_pixels(t, T, calib):
     return x_px, y_px
 
 
-def bgr_from_colorpicker(rgb_tuple):
-    r, g, b = rgb_tuple
-    return (b, g, r)
-
-
 def build_color_mask(roi_bgr, line_color_bgr, h_tol=10, s_tol=80, v_tol=80):
     hsv = cv.cvtColor(roi_bgr, cv.COLOR_BGR2HSV)
     target = np.uint8([[line_color_bgr]])
@@ -68,18 +63,19 @@ def encode_png(img_bgr):
     return io.BytesIO(buf.tobytes())
 
 
-def fit_canvas_size(img_h, img_w, max_w=1200, max_h=900, upscale=False):
-    """Return (width, height) preserving aspect ratio within max bounds."""
+def fit_canvas_size_from_pil(img_pil: Image.Image, max_w=1200, max_h=900, upscale=False):
+    """Return (width, height) preserving aspect ratio (uses PIL size order: w,h)."""
+    w, h = img_pil.size
     if not upscale:
-        max_w = min(max_w, img_w)
-        max_h = min(max_h, img_h)
-    s = min(max_w / img_w, max_h / img_h)
-    return int(img_w * s), int(img_h * s)
+        max_w = min(max_w, w)
+        max_h = min(max_h, h)
+    s = min(max_w / w, max_h / h)
+    return int(w * s), int(h * s)
 
 
-def load_image_rgba(filelike, max_side=1920) -> Image.Image:
-    """Load with Pillow, convert to RGBA, cap size for Fabric.js stability."""
-    img = Image.open(filelike).convert("RGBA")
+def load_image_rgb(filelike, max_side=1920) -> Image.Image:
+    """Load with Pillow, convert to RGB (no alpha), cap size for Fabric.js stability."""
+    img = Image.open(filelike).convert("RGB")
     w, h = img.size
     if w > max_side or h > max_side:
         img.thumbnail((max_side, max_side), Image.LANCZOS)
@@ -122,42 +118,37 @@ if up is None:
     st.stop()
 
 # -------------------------
-# Load image: Pillow → RGBA for canvas; keep BGR for OpenCV processing
+# Load image: Pillow RGB for canvas; keep BGR for OpenCV processing
 # -------------------------
-raw = up.read()  # read exactly once
+raw = up.read()
 try:
-    img_rgba_pil = load_image_rgba(io.BytesIO(raw), max_side=1920)
+    img_rgb_pil = load_image_rgb(io.BytesIO(raw), max_side=1920)  # RGB (no alpha)
 except Exception as e:
     st.error(f"Could not read the image: {e}")
     st.stop()
 
-# For processing, get BGR from the RGBA
-rgb_for_cv = np.array(img_rgba_pil.convert("RGB"))  # (H, W, 3) uint8 RGB
+# For processing, get BGR from the RGB
+rgb_for_cv = np.array(img_rgb_pil)
 img_bgr = cv.cvtColor(rgb_for_cv, cv.COLOR_RGB2BGR)
 H, W = img_bgr.shape[:2]
-
-# Diagnostics (helpful on server)
-st.caption(f"Loaded image size: {W}×{H}, mode: {img_rgba_pil.mode}")
+st.caption(f"Loaded image size: {W}×{H}, mode: {img_rgb_pil.mode}")
 
 # -------------------------
 # ROI selection (left)
 # -------------------------
 st.subheader("Select ROI (draw rectangle)")
 
-# Canvas sized to displayed image
-canvas_w, canvas_h = fit_canvas_size(H, W, max_w=1200, max_h=900, upscale=False)
-
-st.image(
-    img_rgba_pil,
-    caption="PIL RGBA preview",
+canvas_w, canvas_h = fit_canvas_size_from_pil(
+    img_rgb_pil, max_w=1200, max_h=900, upscale=False
 )
+st.image(img_rgb_pil, caption="PIL RGB preview")
 
 canvas_result = st_canvas(
     fill_color="rgba(0, 0, 0, 0)",
     stroke_width=2,
     stroke_color="#00FF00",
-    background_color="#00000000",  # transparent
-    background_image=img_rgba_pil,  # PIL RGBA
+    background_color=None,
+    background_image=img_rgb_pil,
     update_streamlit=True,
     width=canvas_w,
     height=canvas_h,
@@ -174,12 +165,9 @@ if st.button("Apply ROI"):
             st.warning("Please draw a rectangle first.")
         else:
             rect_obj = rect_obj[-1]
-
-            # Get displayed background size safely
             if canvas_result.image_data is not None:
                 canH, canW = canvas_result.image_data.shape[:2]
             else:
-                # Fallback to the configured canvas size
                 canW, canH = canvas_w, canvas_h
 
             sx = W / float(canW)
@@ -191,7 +179,6 @@ if st.button("Apply ROI"):
             h = max(1, int(rect_obj.get("height", 0) * rect_obj.get("scaleY", 1.0) * sy))
             x0, y0 = x, y
             x1, y1 = min(W - 1, x + w), min(H - 1, y + h)
-
             roi_rel = (x0 / W, y0 / H, (x1 - x0) / W, (y1 - y0) / H)
             st.session_state.roi_rel = roi_rel
             st.success(
@@ -200,9 +187,8 @@ if st.button("Apply ROI"):
     else:
         st.warning("Please draw a rectangle first.")
 
-# Show current ROI preview and record absolute rect
 roi_rel = st.session_state.roi_rel
-roi_img, rect_px = crop_roi(img_bgr, roi_rel)  # BGR ROI for processing
+roi_img, rect_px = crop_roi(img_bgr, roi_rel)
 st.session_state.rect = rect_px
 
 # -------------------------
@@ -210,19 +196,16 @@ st.session_state.rect = rect_px
 # -------------------------
 st.subheader("Click 2 calibration points inside ROI")
 
-# Size the calibration canvas to the ROI
 roi_H, roi_W = roi_img.shape[:2]
-cal_w, cal_h = fit_canvas_size(roi_H, roi_W, max_w=1200, max_h=900, upscale=False)
-
-# Background for calibration canvas must be PIL; keep RGBA to be safe
-roi_pil = Image.fromarray(cv.cvtColor(roi_img, cv.COLOR_BGR2RGB)).convert("RGBA")
+roi_pil_rgb = Image.fromarray(cv.cvtColor(roi_img, cv.COLOR_BGR2RGB))
+cal_w, cal_h = fit_canvas_size_from_pil(roi_pil_rgb, max_w=1200, max_h=900, upscale=False)
 
 cal_canvas = st_canvas(
     fill_color="rgba(255, 255, 0, 0.4)",
     stroke_width=8,
     stroke_color="#FFFF00",
-    background_color="#00000000",
-    background_image=roi_pil,
+    background_color=None,
+    background_image=roi_pil_rgb,
     update_streamlit=True,
     width=cal_w,
     height=cal_h,
@@ -230,18 +213,15 @@ cal_canvas = st_canvas(
     key=f"cal_canvas_{up.name}_{cal_w}x{cal_h}",
 )
 
-# Collect clicked points (within ROI)
+# Collect clicked points
 clicked = []
 if cal_canvas.json_data and len(cal_canvas.json_data.get("objects", [])) > 0:
-    # Determine displayed size to scale back to ROI pixels
     if cal_canvas.image_data is not None:
         canH2, canW2 = cal_canvas.image_data.shape[:2]
     else:
         canW2, canH2 = cal_w, cal_h
-
     for o in cal_canvas.json_data["objects"]:
         if o.get("type") in ("path", "circle"):
-            # Approximate center
             cx = int(o.get("left", 0) + (o.get("width", 0) * o.get("scaleX", 1.0)) / 2)
             cy = int(o.get("top", 0) + (o.get("height", 0) * o.get("scaleY", 1.0)) / 2)
             sx = roi_W / float(canW2)
@@ -259,29 +239,20 @@ with c2:
     t2 = st.number_input("Point 2: time", value=1.0, step=0.1, format="%.6f")
     T2 = st.number_input("Point 2: temperature", value=1.0, step=0.1, format="%.6f")
 
-# Build calibration if we have at least 2 clicks
+# Calibration
 calib_ready = False
 if len(clicked) >= 2:
     px = np.array([clicked[0][0], clicked[1][0]], dtype=float)
     py = np.array([clicked[0][1], clicked[1][1]], dtype=float)
     tx = np.array([t1, t2], dtype=float)
     Ty = np.array([T1, T2], dtype=float)
-
     ax, bx = fit_axis_map(px, tx)
     ay, by = fit_axis_map((0 - py), Ty)
-
     calib = (ax, bx, ay, by, 0.0)
     st.session_state.calib = calib
     calib_ready = True
     st.success(
         f"Calibrated: t = {ax:.6f}*x + {bx:.6f};  T = {ay:.6f}*(y0 - y) + {by:.6f}"
-    )
-
-    # Quick verification at point 1
-    t_hat, T_hat = apply_calibration(np.array([px[0]]), np.array([py[0]]), calib)
-    st.caption(
-        f"Verification @ P1 → entered (t={tx[0]:.6f}, T={Ty[0]:.6f}), "
-        f"predicted (t={t_hat[0]:.6f}, T={T_hat[0]:.6f})"
     )
 
 # -------------------------
@@ -308,7 +279,6 @@ if np.isfinite(t_min) or np.isfinite(t_max):
         t_max if np.isfinite(t_max) else None,
     )
 
-# Buttons
 do_extract = st.button("Extract data")
 do_overlay_csv = st.button("Overlay from edited CSV")
 
@@ -319,10 +289,8 @@ if do_extract:
     if not calib_ready:
         st.error("Need two calibration clicks and values first.")
     else:
-        # Build mask with color preference
         if line_color_bgr is not None:
-            h_tol, s_tol, v_tol = 10, 80, 80
-            mask = build_color_mask(roi_img, line_color_bgr, h_tol, s_tol, v_tol)
+            mask = build_color_mask(roi_img, line_color_bgr, 10, 80, 80)
         else:
             mask = mask_colored_curve(roi_img, 60, 40)
 
@@ -334,10 +302,8 @@ if do_extract:
         x_px = x_px_all[valid]
         y_px = y_px_all[valid]
         valid_idx = np.where(valid)[0]
-
         t_data, T_data = apply_calibration(x_px, y_px, st.session_state.calib)
 
-        # Optional time filter
         if time_range is not None:
             tmin, tmax = time_range
             keep = np.ones_like(t_data, dtype=bool)
@@ -352,23 +318,12 @@ if do_extract:
         else:
             ys_vis = ys
 
-        # Overlay
         overlay = overlay_polyline(
-            img_bgr.copy(),
-            st.session_state.rect,
-            ys_vis,
-            color=(0, 0, 0),
-            thickness=2,
+            img_bgr.copy(), st.session_state.rect, ys_vis, color=(0, 0, 0), thickness=2
         )
 
-        # Show results
-        st.image(
-            cv.cvtColor(overlay, cv.COLOR_BGR2RGB),
-            caption="Overlay preview",
-            use_container_width=True,
-        )
+        st.image(cv.cvtColor(overlay, cv.COLOR_BGR2RGB), caption="Overlay preview")
 
-        # Downloads
         csv_bytes = io.BytesIO()
         np.savetxt(
             csv_bytes,
@@ -384,70 +339,10 @@ if do_extract:
             file_name="extracted.csv",
             mime="text/csv",
         )
-
         st.download_button(
             "Download overlay PNG",
             data=encode_png(overlay).getvalue(),
             file_name="overlay.png",
             mime="image/png",
         )
-
         st.session_state.last_overlay = overlay
-
-# -------------------------
-# Overlay from edited CSV
-# -------------------------
-if do_overlay_csv:
-    edited_csv = st.file_uploader(
-        "Upload edited CSV (time,temperature)", type=["csv"], key="csv_upl"
-    )
-    if edited_csv is None:
-        st.warning("Upload a CSV to overlay.")
-    else:
-        if st.session_state.calib is None:
-            st.error("You need a calibration first.")
-        else:
-            try:
-                data = np.genfromtxt(edited_csv, delimiter=",", names=True)
-                t = np.asarray(data["time"], dtype=float)
-                T = np.asarray(data["temperature"], dtype=float)
-            except Exception:
-                edited_csv.seek(0)
-                data = np.genfromtxt(edited_csv, delimiter=",")
-                if data.ndim != 2 or data.shape[1] < 2:
-                    st.error("CSV must have two columns: time,temperature")
-                    st.stop()
-                t = np.asarray(data[:, 0], dtype=float)
-                T = np.asarray(data[:, 1], dtype=float)
-
-            order = np.argsort(t)
-            t = t[order]
-            T = T[order]
-
-            x_px, y_px = data_to_pixels(t, T, st.session_state.calib)
-
-            x0, y0, x1, y1 = st.session_state.rect
-            w = x1 - x0
-            h = y1 - y0
-            m = np.isfinite(x_px) & np.isfinite(y_px)
-            m &= (x_px >= 0) & (x_px < w) & (y_px >= 0) & (y_px < h)
-
-            x_img = x0 + np.clip(x_px[m], 0, w - 1)
-            y_img = y0 + np.clip(y_px[m], 0, h - 1)
-
-            overlay2 = img_bgr.copy()
-            pts = np.stack([x_img, y_img], axis=1).astype(np.int32)
-            if len(pts) >= 2:
-                cv.polylines(overlay2, [pts], False, (0, 0, 0), 2, cv.LINE_AA)
-
-            st.image(
-                cv.cvtColor(overlay2, cv.COLOR_BGR2RGB),
-                caption="Overlay from edited CSV",
-                use_container_width=True,
-            )
-            st.download_button(
-                "Download overlay PNG",
-                data=encode_png(overlay2).getvalue(),
-                file_name="overlay_fromcsv.png",
-                mime="image/png",
-            )
