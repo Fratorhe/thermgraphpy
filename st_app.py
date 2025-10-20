@@ -150,7 +150,6 @@ canvas_w, canvas_h = fit_canvas_size(H, W, max_w=1200, max_h=900, upscale=False)
 st.image(
     img_rgba_pil,
     caption="PIL RGBA preview",
-    use_container_width=False,
 )
 
 canvas_result = st_canvas(
