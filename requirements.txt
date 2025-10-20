@@ -1,6 +1,6 @@
 streamlit==1.34.0
-streamlit-drawable-canvas==0.9
+numpy==1.26.4
 opencv-python-headless==4.10.0.84
 Pillow==10.4.0
-numpy==1.26.4
 protobuf<5
+git+https://github.com/bowespublishing/streamlit-drawable-canvas.git
