@@ -1,6 +1,12 @@
 # app.py
 # Streamlit GUI for extracting time–temperature data from screenshots
-# pip install streamlit opencv-python numpy pillow streamlit-drawable-canvas
+# Suggested requirements:
+# streamlit==1.34.0
+# streamlit-drawable-canvas==0.9
+# opencv-python-headless==4.10.0.84
+# Pillow==10.4.0
+# numpy==1.26.4
+# protobuf<5
 
 import io
 from pathlib import Path
@@ -24,6 +30,9 @@ from src.utils import (
 st.set_page_config(page_title="Time–Temperature Extractor", layout="wide")
 
 
+# -------------------------
+# Helpers
+# -------------------------
 def data_to_pixels(t, T, calib):
     ax, bx, ay, by, y0_px = calib
     if abs(ax) < 1e-12 or abs(ay) < 1e-12:
@@ -68,6 +77,15 @@ def fit_canvas_size(img_h, img_w, max_w=1200, max_h=900, upscale=False):
     return int(img_w * s), int(img_h * s)
 
 
+def load_image_rgba(filelike, max_side=1920) -> Image.Image:
+    """Load with Pillow, convert to RGBA, cap size for Fabric.js stability."""
+    img = Image.open(filelike).convert("RGBA")
+    w, h = img.size
+    if w > max_side or h > max_side:
+        img.thumbnail((max_side, max_side), Image.LANCZOS)
+    return img
+
+
 # -------------------------
 # Streamlit UI state
 # -------------------------
@@ -103,64 +121,77 @@ if up is None:
     st.info("Upload a screenshot to begin.")
     st.stop()
 
-# Read and keep image in BGR
-file_bytes = np.asarray(bytearray(up.read()), dtype=np.uint8)
-img_bgr = cv.imdecode(file_bytes, cv.IMREAD_COLOR)
-if img_bgr is None:
-    st.error("Could not read the image.")
+# -------------------------
+# Load image: Pillow → RGBA for canvas; keep BGR for OpenCV processing
+# -------------------------
+raw = up.read()  # read exactly once
+try:
+    img_rgba_pil = load_image_rgba(io.BytesIO(raw), max_side=1920)
+except Exception as e:
+    st.error(f"Could not read the image: {e}")
     st.stop()
 
-# FIX: Convert BGR → RGB for Streamlit / canvas display, keep a PIL image for background_image
-img_rgb = cv.cvtColor(img_bgr, cv.COLOR_BGR2RGB)
-img_pil = Image.fromarray(img_rgb)
+# For processing, get BGR from the RGBA
+rgb_for_cv = np.array(img_rgba_pil.convert("RGB"))  # (H, W, 3) uint8 RGB
+img_bgr = cv.cvtColor(rgb_for_cv, cv.COLOR_RGB2BGR)
 H, W = img_bgr.shape[:2]
+
+# Diagnostics (helpful on server)
+st.caption(f"Loaded image size: {W}×{H}, mode: {img_rgba_pil.mode}")
 
 # -------------------------
 # ROI selection (left)
 # -------------------------
 st.subheader("Select ROI (draw rectangle)")
 
-# FIX: Size the canvas to the actual displayed image aspect
+# Canvas sized to displayed image
 canvas_w, canvas_h = fit_canvas_size(H, W, max_w=1200, max_h=900, upscale=False)
 
 canvas_result = st_canvas(
     fill_color="rgba(0, 0, 0, 0)",
     stroke_width=2,
     stroke_color="#00FF00",
-    background_color="#00000000",
-    background_image=img_pil,  # PIL image in RGB
+    background_color="#00000000",  # transparent
+    background_image=img_rgba_pil,  # PIL RGBA
     update_streamlit=True,
     width=canvas_w,
     height=canvas_h,
     drawing_mode="rect",
-    key="roi_canvas",
+    key=f"roi_canvas_{up.name}_{canvas_w}x{canvas_h}",
 )
 
 if st.button("Apply ROI"):
-    if canvas_result.json_data and len(canvas_result.json_data["objects"]) > 0:
+    if canvas_result.json_data and len(canvas_result.json_data.get("objects", [])) > 0:
         rect_obj = [
             o for o in canvas_result.json_data["objects"] if o.get("type") == "rect"
-        ][-1]
+        ]
+        if not rect_obj:
+            st.warning("Please draw a rectangle first.")
+        else:
+            rect_obj = rect_obj[-1]
 
-        # Scale canvas coordinates to original image coordinates
-        # Use canvas_result.image_data size as the reference for displayed background
-        bg = canvas_result.image_data  # (Hc, Wc, 4)
-        canH, canW = bg.shape[:2]
-        sx = W / canW
-        sy = H / canH
+            # Get displayed background size safely
+            if canvas_result.image_data is not None:
+                canH, canW = canvas_result.image_data.shape[:2]
+            else:
+                # Fallback to the configured canvas size
+                canW, canH = canvas_w, canvas_h
 
-        x = max(0, int(rect_obj["left"] * sx))
-        y = max(0, int(rect_obj["top"] * sy))
-        w = max(1, int(rect_obj["width"] * rect_obj.get("scaleX", 1.0) * sx))
-        h = max(1, int(rect_obj["height"] * rect_obj.get("scaleY", 1.0) * sy))
-        x0, y0 = x, y
-        x1, y1 = min(W - 1, x + w), min(H - 1, y + h)
+            sx = W / float(canW)
+            sy = H / float(canH)
 
-        roi_rel = (x0 / W, y0 / H, (x1 - x0) / W, (y1 - y0) / H)
-        st.session_state.roi_rel = roi_rel
-        st.success(
-            f"ROI set to (x={roi_rel[0]:.3f}, y={roi_rel[1]:.3f}, w={roi_rel[2]:.3f}, h={roi_rel[3]:.3f})"
-        )
+            x = max(0, int(rect_obj.get("left", 0) * sx))
+            y = max(0, int(rect_obj.get("top", 0) * sy))
+            w = max(1, int(rect_obj.get("width", 0) * rect_obj.get("scaleX", 1.0) * sx))
+            h = max(1, int(rect_obj.get("height", 0) * rect_obj.get("scaleY", 1.0) * sy))
+            x0, y0 = x, y
+            x1, y1 = min(W - 1, x + w), min(H - 1, y + h)
+
+            roi_rel = (x0 / W, y0 / H, (x1 - x0) / W, (y1 - y0) / H)
+            st.session_state.roi_rel = roi_rel
+            st.success(
+                f"ROI set to (x={roi_rel[0]:.3f}, y={roi_rel[1]:.3f}, w={roi_rel[2]:.3f}, h={roi_rel[3]:.3f})"
+            )
     else:
         st.warning("Please draw a rectangle first.")
 
@@ -174,37 +205,42 @@ st.session_state.rect = rect_px
 # -------------------------
 st.subheader("Click 2 calibration points inside ROI")
 
-# FIX: Size the calibration canvas to the ROI size, not the full image
+# Size the calibration canvas to the ROI
 roi_H, roi_W = roi_img.shape[:2]
 cal_w, cal_h = fit_canvas_size(roi_H, roi_W, max_w=1200, max_h=900, upscale=False)
-roi_rgb = cv.cvtColor(roi_img, cv.COLOR_BGR2RGB)
-roi_pil = Image.fromarray(roi_rgb)
+
+# Background for calibration canvas must be PIL; keep RGBA to be safe
+roi_pil = Image.fromarray(cv.cvtColor(roi_img, cv.COLOR_BGR2RGB)).convert("RGBA")
 
 cal_canvas = st_canvas(
     fill_color="rgba(255, 255, 0, 0.4)",
     stroke_width=8,
     stroke_color="#FFFF00",
     background_color="#00000000",
-    background_image=roi_pil,  # PIL image in RGB
+    background_image=roi_pil,
     update_streamlit=True,
     width=cal_w,
     height=cal_h,
     drawing_mode="point",
-    key="cal_canvas",
+    key=f"cal_canvas_{up.name}_{cal_w}x{cal_h}",
 )
 
 # Collect clicked points (within ROI)
 clicked = []
-if cal_canvas.json_data and len(cal_canvas.json_data["objects"]) > 0:
+if cal_canvas.json_data and len(cal_canvas.json_data.get("objects", [])) > 0:
+    # Determine displayed size to scale back to ROI pixels
+    if cal_canvas.image_data is not None:
+        canH2, canW2 = cal_canvas.image_data.shape[:2]
+    else:
+        canW2, canH2 = cal_w, cal_h
+
     for o in cal_canvas.json_data["objects"]:
         if o.get("type") in ("path", "circle"):
-            cx = int((o.get("left", 0) + (o.get("width", 0) * o.get("scaleX", 1.0)) / 2))
-            cy = int((o.get("top", 0) + (o.get("height", 0) * o.get("scaleY", 1.0)) / 2))
-            # Map canvas coords to ROI pixel coords
-            bg = cal_canvas.image_data
-            canH, canW = bg.shape[:2]
-            sx = roi_W / canW
-            sy = roi_H / canH
+            # Approximate center
+            cx = int(o.get("left", 0) + (o.get("width", 0) * o.get("scaleX", 1.0)) / 2)
+            cy = int(o.get("top", 0) + (o.get("height", 0) * o.get("scaleY", 1.0)) / 2)
+            sx = roi_W / float(canW2)
+            sy = roi_H / float(canH2)
             px = int(cx * sx)
             py = int(cy * sy)
             clicked.append((px, py))
@@ -225,8 +261,10 @@ if len(clicked) >= 2:
     py = np.array([clicked[0][1], clicked[1][1]], dtype=float)
     tx = np.array([t1, t2], dtype=float)
     Ty = np.array([T1, T2], dtype=float)
+
     ax, bx = fit_axis_map(px, tx)
     ay, by = fit_axis_map((0 - py), Ty)
+
     calib = (ax, bx, ay, by, 0.0)
     st.session_state.calib = calib
     calib_ready = True
