@@ -34,7 +34,6 @@ def data_to_pixels(t, T, calib):
 
 
 def bgr_from_colorpicker(rgb_tuple):
-    # Streamlit color_picker returns HEX; we’ll convert elsewhere. Here if tuple provided.
     r, g, b = rgb_tuple
     return (b, g, r)
 
@@ -58,6 +57,15 @@ def encode_png(img_bgr):
     if not ok:
         raise RuntimeError("Failed to encode image.")
     return io.BytesIO(buf.tobytes())
+
+
+def fit_canvas_size(img_h, img_w, max_w=1200, max_h=900, upscale=False):
+    """Return (width, height) preserving aspect ratio within max bounds."""
+    if not upscale:
+        max_w = min(max_w, img_w)
+        max_h = min(max_h, img_h)
+    s = min(max_w / img_w, max_h / img_h)
+    return int(img_w * s), int(img_h * s)
 
 
 # -------------------------
@@ -102,63 +110,52 @@ if img_bgr is None:
     st.error("Could not read the image.")
     st.stop()
 
-# Convert BGR → RGB
+# FIX: Convert BGR → RGB for Streamlit / canvas display, keep a PIL image for background_image
 img_rgb = cv.cvtColor(img_bgr, cv.COLOR_BGR2RGB)
-
+img_pil = Image.fromarray(img_rgb)
 H, W = img_bgr.shape[:2]
-
-
-def fit_canvas_size(img_h, img_w, max_w=1200, max_h=900, upscale=False):
-    """Return (width, height) preserving aspect ratio within max bounds."""
-    if not upscale:
-        max_w = min(max_w, img_w)
-        max_h = min(max_h, img_h)
-    s = min(max_w / img_w, max_h / img_h)
-    return int(img_w * s), int(img_h * s)
-
 
 # -------------------------
 # ROI selection (left)
 # -------------------------
 st.subheader("Select ROI (draw rectangle)")
-# Show canvas to draw a rectangle
-disp_img = cv.cvtColor(img_bgr, cv.COLOR_BGR2RGB)
-H, W = disp_img.shape[:2]
+
+# FIX: Size the canvas to the actual displayed image aspect
 canvas_w, canvas_h = fit_canvas_size(H, W, max_w=1200, max_h=900, upscale=False)
 
 canvas_result = st_canvas(
     fill_color="rgba(0, 0, 0, 0)",
     stroke_width=2,
     stroke_color="#00FF00",
-    background_image=Image.fromarray(disp_img),
+    background_color="#00000000",
+    background_image=img_pil,  # PIL image in RGB
     update_streamlit=True,
-    width=canvas_w,  # set both width
-    height=canvas_h,  # and height consistently
+    width=canvas_w,
+    height=canvas_h,
     drawing_mode="rect",
     key="roi_canvas",
 )
 
 if st.button("Apply ROI"):
     if canvas_result.json_data and len(canvas_result.json_data["objects"]) > 0:
-        # get last rectangle
         rect_obj = [
             o for o in canvas_result.json_data["objects"] if o.get("type") == "rect"
         ][-1]
-        # Canvas coordinates are in displayed pixels; map to original size via scaleX/Y
-        # The st_canvas returns absolute coords in the displayed canvas; we need scale
-        # st_canvas stores width/height of background_image into object 'scaleX','scaleY' sometimes;
-        # safer: compute scale by comparing canvas background pixel size to original
-        bg = canvas_result.image_data
+
+        # Scale canvas coordinates to original image coordinates
+        # Use canvas_result.image_data size as the reference for displayed background
+        bg = canvas_result.image_data  # (Hc, Wc, 4)
         canH, canW = bg.shape[:2]
         sx = W / canW
         sy = H / canH
+
         x = max(0, int(rect_obj["left"] * sx))
         y = max(0, int(rect_obj["top"] * sy))
         w = max(1, int(rect_obj["width"] * rect_obj.get("scaleX", 1.0) * sx))
         h = max(1, int(rect_obj["height"] * rect_obj.get("scaleY", 1.0) * sy))
         x0, y0 = x, y
         x1, y1 = min(W - 1, x + w), min(H - 1, y + h)
-        # Normalize
+
         roi_rel = (x0 / W, y0 / H, (x1 - x0) / W, (y1 - y0) / H)
         st.session_state.roi_rel = roi_rel
         st.success(
@@ -167,30 +164,31 @@ if st.button("Apply ROI"):
     else:
         st.warning("Please draw a rectangle first.")
 
-# Show current ROI preview
+# Show current ROI preview and record absolute rect
 roi_rel = st.session_state.roi_rel
-roi_img, rect_px = crop_roi(img_bgr, roi_rel)
+roi_img, rect_px = crop_roi(img_bgr, roi_rel)  # BGR ROI for processing
 st.session_state.rect = rect_px
-# st.image(
-#     cv.cvtColor(roi_img, cv.COLOR_BGR2RGB),
-#     caption="ROI preview",
-#     use_container_width=True,
-# )
 
 # -------------------------
 # Calibration & extraction (right)
 # -------------------------
 st.subheader("Click 2 calibration points inside ROI")
-# Show ROI on a canvas to click points (use circle drawing; we’ll harvest centers)
+
+# FIX: Size the calibration canvas to the ROI size, not the full image
+roi_H, roi_W = roi_img.shape[:2]
+cal_w, cal_h = fit_canvas_size(roi_H, roi_W, max_w=1200, max_h=900, upscale=False)
 roi_rgb = cv.cvtColor(roi_img, cv.COLOR_BGR2RGB)
+roi_pil = Image.fromarray(roi_rgb)
+
 cal_canvas = st_canvas(
     fill_color="rgba(255, 255, 0, 0.4)",
     stroke_width=8,
     stroke_color="#FFFF00",
-    background_image=Image.fromarray(roi_rgb),
+    background_color="#00000000",
+    background_image=roi_pil,  # PIL image in RGB
     update_streamlit=True,
-    width=canvas_w,  # set both width
-    height=canvas_h,  # and height consistently
+    width=cal_w,
+    height=cal_h,
     drawing_mode="point",
     key="cal_canvas",
 )
@@ -199,16 +197,14 @@ cal_canvas = st_canvas(
 clicked = []
 if cal_canvas.json_data and len(cal_canvas.json_data["objects"]) > 0:
     for o in cal_canvas.json_data["objects"]:
-        # For 'circle' points from st_canvas, centerX/centerY can be derived
         if o.get("type") in ("path", "circle"):
-            # For a 'path' point click, 'left'/'top' reflect top-left of a small path; approximate center
             cx = int((o.get("left", 0) + (o.get("width", 0) * o.get("scaleX", 1.0)) / 2))
             cy = int((o.get("top", 0) + (o.get("height", 0) * o.get("scaleY", 1.0)) / 2))
             # Map canvas coords to ROI pixel coords
             bg = cal_canvas.image_data
             canH, canW = bg.shape[:2]
-            sx = roi_img.shape[1] / canW
-            sy = roi_img.shape[0] / canH
+            sx = roi_W / canW
+            sy = roi_H / canH
             px = int(cx * sx)
             py = int(cy * sy)
             clicked.append((px, py))
@@ -282,7 +278,6 @@ if do_extract:
     else:
         # Build mask with color preference
         if line_color_bgr is not None:
-            # fixed default tolerances
             h_tol, s_tol, v_tol = 10, 80, 80
             mask = build_color_mask(roi_img, line_color_bgr, h_tol, s_tol, v_tol)
         else:
