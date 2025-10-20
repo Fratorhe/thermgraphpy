@@ -63,22 +63,20 @@ def encode_png(img_bgr):
     return io.BytesIO(buf.tobytes())
 
 
-def fit_canvas_size_from_pil(img_pil: Image.Image, max_w=1200, max_h=900, upscale=False):
-    """Return (width, height) preserving aspect ratio (uses PIL size order: w,h)."""
-    w, h = img_pil.size
-    if not upscale:
-        max_w = min(max_w, w)
-        max_h = min(max_h, h)
-    s = min(max_w / w, max_h / h)
-    return int(w * s), int(h * s)
-
-
-def load_image_rgb(filelike, max_side=1920) -> Image.Image:
-    """Load with Pillow, convert to RGB (no alpha), cap size for Fabric.js stability."""
-    img = Image.open(filelike).convert("RGB")
+def load_image_rgba_opaque(filelike, max_side=1920) -> Image.Image:
+    """
+    Load with Pillow, convert to RGBA with fully opaque alpha (255),
+    cap size to improve Fabric.js stability.
+    """
+    img = Image.open(filelike).convert("RGBA")
     w, h = img.size
     if w > max_side or h > max_side:
         img.thumbnail((max_side, max_side), Image.LANCZOS)
+    # ensure fully opaque alpha (some PNGs carry transparency that Fabric can mishandle)
+    if img.getbands() == ("R", "G", "B", "A"):
+        r, g, b, a = img.split()
+        full = Image.new("L", img.size, 255)
+        img = Image.merge("RGBA", (r, g, b, full))
     return img
 
 
@@ -118,42 +116,41 @@ if up is None:
     st.stop()
 
 # -------------------------
-# Load image: Pillow RGB for canvas; keep BGR for OpenCV processing
+# Load image: RGBA (opaque) for canvas; get BGR for OpenCV processing
 # -------------------------
 raw = up.read()
 try:
-    img_rgb_pil = load_image_rgb(io.BytesIO(raw), max_side=1920)  # RGB (no alpha)
+    img_rgba_pil = load_image_rgba_opaque(
+        io.BytesIO(raw), max_side=1920
+    )  # RGBA with alpha=255
 except Exception as e:
     st.error(f"Could not read the image: {e}")
     st.stop()
 
-# For processing, get BGR from the RGB
-rgb_for_cv = np.array(img_rgb_pil)
+# For processing (OpenCV expects BGR)
+rgb_for_cv = np.array(img_rgba_pil.convert("RGB"))
 img_bgr = cv.cvtColor(rgb_for_cv, cv.COLOR_RGB2BGR)
 H, W = img_bgr.shape[:2]
-st.caption(f"Loaded image size: {W}×{H}, mode: {img_rgb_pil.mode}")
+st.caption(f"Loaded image size: {W}×{H}, mode: {img_rgba_pil.mode}")
 
 # -------------------------
-# ROI selection (left)
+# ROI selection (left) — use EXACT image size for the canvas
 # -------------------------
 st.subheader("Select ROI (draw rectangle)")
 
-canvas_w, canvas_h = fit_canvas_size_from_pil(
-    img_rgb_pil, max_w=1200, max_h=900, upscale=False
-)
-st.image(img_rgb_pil, caption="PIL RGB preview")
+st.image(img_rgba_pil.convert("RGB"), caption="Preview")
 
 canvas_result = st_canvas(
     fill_color="rgba(0, 0, 0, 0)",
     stroke_width=2,
     stroke_color="#00FF00",
-    background_color=None,
-    background_image=img_rgb_pil,
+    background_color="#ffffff",  # solid background avoids transparent glitches
+    background_image=img_rgba_pil,  # PIL RGBA (opaque alpha)
     update_streamlit=True,
-    width=canvas_w,
-    height=canvas_h,
+    width=img_rgba_pil.width,  # exact size prevents Fabric scaling blank
+    height=img_rgba_pil.height,
     drawing_mode="rect",
-    key=f"roi_canvas_{up.name}_{canvas_w}x{canvas_h}",
+    key=f"roi_canvas_{up.name}_{img_rgba_pil.width}x{img_rgba_pil.height}",
 )
 
 if st.button("Apply ROI"):
@@ -165,10 +162,12 @@ if st.button("Apply ROI"):
             st.warning("Please draw a rectangle first.")
         else:
             rect_obj = rect_obj[-1]
+
+            # Use the actual displayed raster size as reported by st_canvas
             if canvas_result.image_data is not None:
                 canH, canW = canvas_result.image_data.shape[:2]
             else:
-                canW, canH = canvas_w, canvas_h
+                canW, canH = img_rgba_pil.width, img_rgba_pil.height
 
             sx = W / float(canW)
             sy = H / float(canH)
@@ -179,6 +178,7 @@ if st.button("Apply ROI"):
             h = max(1, int(rect_obj.get("height", 0) * rect_obj.get("scaleY", 1.0) * sy))
             x0, y0 = x, y
             x1, y1 = min(W - 1, x + w), min(H - 1, y + h)
+
             roi_rel = (x0 / W, y0 / H, (x1 - x0) / W, (y1 - y0) / H)
             st.session_state.roi_rel = roi_rel
             st.success(
@@ -187,8 +187,9 @@ if st.button("Apply ROI"):
     else:
         st.warning("Please draw a rectangle first.")
 
+# Show current ROI preview (processing path uses BGR)
 roi_rel = st.session_state.roi_rel
-roi_img, rect_px = crop_roi(img_bgr, roi_rel)
+roi_img, rect_px = crop_roi(img_bgr, roi_rel)  # BGR ROI for processing
 st.session_state.rect = rect_px
 
 # -------------------------
@@ -196,30 +197,34 @@ st.session_state.rect = rect_px
 # -------------------------
 st.subheader("Click 2 calibration points inside ROI")
 
-roi_H, roi_W = roi_img.shape[:2]
-roi_pil_rgb = Image.fromarray(cv.cvtColor(roi_img, cv.COLOR_BGR2RGB))
-cal_w, cal_h = fit_canvas_size_from_pil(roi_pil_rgb, max_w=1200, max_h=900, upscale=False)
+# Use EXACT ROI size for the calibration canvas
+roi_pil_rgba = Image.fromarray(cv.cvtColor(roi_img, cv.COLOR_BGR2RGB)).convert("RGBA")
+# Ensure fully opaque alpha
+r, g, b, a = roi_pil_rgba.split()
+roi_pil_rgba = Image.merge("RGBA", (r, g, b, Image.new("L", roi_pil_rgba.size, 255)))
 
 cal_canvas = st_canvas(
     fill_color="rgba(255, 255, 0, 0.4)",
     stroke_width=8,
     stroke_color="#FFFF00",
-    background_color=None,
-    background_image=roi_pil_rgb,
+    background_color="#ffffff",
+    background_image=roi_pil_rgba,
     update_streamlit=True,
-    width=cal_w,
-    height=cal_h,
+    width=roi_pil_rgba.width,
+    height=roi_pil_rgba.height,
     drawing_mode="point",
-    key=f"cal_canvas_{up.name}_{cal_w}x{cal_h}",
+    key=f"cal_canvas_{up.name}_{roi_pil_rgba.width}x{roi_pil_rgba.height}",
 )
 
-# Collect clicked points
+# Collect clicked points (within ROI)
 clicked = []
 if cal_canvas.json_data and len(cal_canvas.json_data.get("objects", [])) > 0:
     if cal_canvas.image_data is not None:
         canH2, canW2 = cal_canvas.image_data.shape[:2]
     else:
-        canW2, canH2 = cal_w, cal_h
+        canW2, canH2 = roi_pil_rgba.width, roi_pil_rgba.height
+
+    roi_H, roi_W = roi_img.shape[:2]
     for o in cal_canvas.json_data["objects"]:
         if o.get("type") in ("path", "circle"):
             cx = int(o.get("left", 0) + (o.get("width", 0) * o.get("scaleX", 1.0)) / 2)
@@ -239,20 +244,29 @@ with c2:
     t2 = st.number_input("Point 2: time", value=1.0, step=0.1, format="%.6f")
     T2 = st.number_input("Point 2: temperature", value=1.0, step=0.1, format="%.6f")
 
-# Calibration
+# Build calibration if we have at least 2 clicks
 calib_ready = False
 if len(clicked) >= 2:
     px = np.array([clicked[0][0], clicked[1][0]], dtype=float)
     py = np.array([clicked[0][1], clicked[1][1]], dtype=float)
     tx = np.array([t1, t2], dtype=float)
     Ty = np.array([T1, T2], dtype=float)
+
     ax, bx = fit_axis_map(px, tx)
     ay, by = fit_axis_map((0 - py), Ty)
+
     calib = (ax, bx, ay, by, 0.0)
     st.session_state.calib = calib
     calib_ready = True
     st.success(
         f"Calibrated: t = {ax:.6f}*x + {bx:.6f};  T = {ay:.6f}*(y0 - y) + {by:.6f}"
+    )
+
+    # Quick verification at point 1
+    t_hat, T_hat = apply_calibration(np.array([px[0]]), np.array([py[0]]), calib)
+    st.caption(
+        f"Verification @ P1 → entered (t={tx[0]:.6f}, T={Ty[0]:.6f}), "
+        f"predicted (t={t_hat[0]:.6f}, T={T_hat[0]:.6f})"
     )
 
 # -------------------------
@@ -279,6 +293,7 @@ if np.isfinite(t_min) or np.isfinite(t_max):
         t_max if np.isfinite(t_max) else None,
     )
 
+# Buttons
 do_extract = st.button("Extract data")
 do_overlay_csv = st.button("Overlay from edited CSV")
 
@@ -302,6 +317,7 @@ if do_extract:
         x_px = x_px_all[valid]
         y_px = y_px_all[valid]
         valid_idx = np.where(valid)[0]
+
         t_data, T_data = apply_calibration(x_px, y_px, st.session_state.calib)
 
         if time_range is not None:
@@ -346,3 +362,59 @@ if do_extract:
             mime="image/png",
         )
         st.session_state.last_overlay = overlay
+
+# -------------------------
+# Overlay from edited CSV
+# -------------------------
+if do_overlay_csv:
+    edited_csv = st.file_uploader(
+        "Upload edited CSV (time,temperature)", type=["csv"], key="csv_upl"
+    )
+    if edited_csv is None:
+        st.warning("Upload a CSV to overlay.")
+    else:
+        if st.session_state.calib is None:
+            st.error("You need a calibration first.")
+        else:
+            try:
+                data = np.genfromtxt(edited_csv, delimiter=",", names=True)
+                t = np.asarray(data["time"], dtype=float)
+                T = np.asarray(data["temperature"], dtype=float)
+            except Exception:
+                edited_csv.seek(0)
+                data = np.genfromtxt(edited_csv, delimiter=",")
+                if data.ndim != 2 or data.shape[1] < 2:
+                    st.error("CSV must have two columns: time,temperature")
+                    st.stop()
+                t = np.asarray(data[:, 0], dtype=float)
+                T = np.asarray(data[:, 1], dtype=float)
+
+            order = np.argsort(t)
+            t = t[order]
+            T = T[order]
+
+            x_px, y_px = data_to_pixels(t, T, st.session_state.calib)
+
+            x0, y0, x1, y1 = st.session_state.rect
+            w = x1 - x0
+            h = y1 - y0
+            m = np.isfinite(x_px) & np.isfinite(y_px)
+            m &= (x_px >= 0) & (x_px < w) & (y_px >= 0) & (y_px < h)
+
+            x_img = x0 + np.clip(x_px[m], 0, w - 1)
+            y_img = y0 + np.clip(y_px[m], 0, h - 1)
+
+            overlay2 = img_bgr.copy()
+            pts = np.stack([x_img, y_img], axis=1).astype(np.int32)
+            if len(pts) >= 2:
+                cv.polylines(overlay2, [pts], False, (0, 0, 0), 2, cv.LINE_AA)
+
+            st.image(
+                cv.cvtColor(overlay2, cv.COLOR_BGR2RGB), caption="Overlay from edited CSV"
+            )
+            st.download_button(
+                "Download overlay PNG",
+                data=encode_png(overlay2).getvalue(),
+                file_name="overlay_fromcsv.png",
+                mime="image/png",
+            )
