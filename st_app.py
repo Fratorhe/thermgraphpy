@@ -102,6 +102,9 @@ if img_bgr is None:
     st.error("Could not read the image.")
     st.stop()
 
+# Convert BGR → RGB
+img_rgb = cv.cvtColor(img_bgr, cv.COLOR_BGR2RGB)
+
 H, W = img_bgr.shape[:2]
 
 
