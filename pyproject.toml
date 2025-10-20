@@ -1,0 +1,33 @@
+[project]
+name = "thermgraphpy"
+version = "0.1.0"
+description = "Python package to extract data from graphs, particularly time vs temperature plots. Includes a Streamlit web interface for easy use."
+readme = "README.md"
+license = { text = "MIT" }
+authors = [
+    { name = "Francisco Torres Herrador", email = "francisco.torres@nmsu.edu" }
+]
+requires-python = ">=3.9"
+
+# Core dependencies
+dependencies = [
+    "streamlit>=1.34",
+    "numpy>=1.26",
+    "opencv-python-headless==4.10.0.84",
+    "Pillow>=10.0",
+    "streamlit-drawable-canvas>=0.9"
+]
+
+[project.urls]
+Homepage = "https://github.com/fratorhe/thermgraphpy"
+Repository = "https://github.com/fratorhe/thermgraphpy"
+Issues = "https://github.com/fratorhe/thermgraphpy/issues"
+
+# Optional entry points for Streamlit app
+[project.scripts]
+thermgraphpy = "thermgraphpy.app:main"
+
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
